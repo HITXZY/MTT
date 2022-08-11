@@ -1,0 +1,132 @@
+%{
+    2022.7.18
+    JPDA，使用标准KF
+    量测生成使用其他代码
+    ·V1.0 
+%}
+
+%% 目标生成
+clc
+clear
+close all
+meas_2dcv;
+X_est = cell(1,N);
+P_est = cell(1,N);
+X_est{1} = X{1};
+P_est{1} = repmat(10*eye(nx),1,1,T);
+Pd = 0.99; Pg = 0.9997;            % 检测率；真实量测落入波门概率
+X_plt2 = X{1};
+%% JPDA(使用标准KF)
+for k = 1:N-1
+    mk = size(Z{k+1},2);
+    %----------------------------------------------------------% KF预测步
+    for t = 1:T
+        X_pre(:,t) = F * X_est{k}(:,t);
+        P_pre(:,:,t) = F * P_est{k}(:,:,t) * F';
+        Z_pre(:,t) = H * X_pre(:,t);
+        S(:,:,t) = H * P_pre(:,:,t) * H' + R;
+        K{t} = P_pre(:,:,t) * H' / S(:,:,t);
+    end
+
+    %----------------------------------------------------------% 确认矩阵Ω
+    OMEGA = zeros(mk,T);
+    dis = zeros(mk,T);
+    for j = 1:mk
+        for t = 1:T
+            nu{j,t} = Z{k+1}(:,j) - Z_pre(:,t);
+            dis(j,t) = nu{j,t}' / S(:,:,t) * nu{j,t};
+            if dis(j,t) < gamma/3
+                OMEGA(j,t) = 1;
+            end
+        end
+    end
+    OMEGA = [ones(mk,1),OMEGA];
+    %----------------------------------------------------------% 矩阵拆分
+    param.T = T;
+    param.mk = mk;
+    [omega,nk] = split(OMEGA,param);          % 互联矩阵与可行互联事件数
+
+    %----------------------------------------------------------% θ(i)事件后验概率计算
+    delta = cell(1,nk);                       % 目标检测指示，事件i中目标t是否与任何一个量测互联上
+    tao = cell(1,nk);                         % 量测互联指示，事件i中量测j是否与某个真实目标互联
+    fai = cell(1,nk);                         % 假量测数
+    miuF = cell(1,nk);                        % 概率质量函数(pmf)，代表杂波分布
+    for i = 1:nk
+        for t = 2:T+1
+            delta{i}(t) = sum(omega{i}(:,t));    
+            pr_t_temp{i}(t) = Pd^delta{i}(t) * (1-Pd)^(1-delta{i}(t));
+        end
+        pr_t(i) = prod(pr_t_temp{i}(2:end));
+        for j = 1:mk
+            tao{i}(j) = sum(omega{i}(j,2:end)); 
+            %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+            ind = find(omega{i}(j,:)==1);
+            S_ext = cat(3,R,S);
+            dis_ext = cat(2,zeros(mk,1),dis);
+            Nt = 1/(2*pi*sqrt(det(S_ext(:,:,ind)))) * exp(dis_ext(j,ind));
+            pr_j_temp{i}(j) = Nt^tao{i}(j);
+            %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+        end
+        pr_j(i) = prod(pr_j_temp{i});
+        fai{i} = mk - sum(tao{i});
+%         miuF{i} = 1;                                % 均匀分布
+        miuF{i} = exp(-lambda*Vgate) * (lambda*Vgate)^fai{i} / factorial(fai{i});   % 泊松分布
+        pr_post(i) = factorial(fai{i}) / factorial(mk) * miuF{i} * Vgate^(-fai{i})...
+            * pr_t(i) * pr_j(i);
+    end
+    pr_post = pr_post/sum(pr_post);
+    %----------------------------------------------------------% 互联概率计算（βjt(k)）
+    % βjt(k) 目标t和量测j关联上的概率
+    beta = zeros(mk,T+1);
+    for t = 1:T+1
+        for j = 1:mk
+            for i = 1:nk
+                beta(j,t) = beta(j,t) + omega{i}(j,t) * pr_post(i);
+            end
+        end
+        beta0(t) = 1 - sum(beta(:,t));
+    end
+    %----------------------------------------------------------% KF更新步
+    for t = 1:T
+        X_est{k+1}(:,t) = beta0(t+1) * X_pre(:,t);
+        P_est{k+1}(:,:,t) = P_pre(:,:,t) - (1-beta0(t+1)) * K{t} * S(:,:,t) * K{t}'...
+            + beta0(t+1) * X_pre(:,t) * X_pre(:,t)';
+        for j = 1:mk
+            Xjt_est{j,t} = X_pre(:,t) + K{t} * nu{j,t};        % 第j个量测对第t个目标的KF估计
+            X_est{k+1}(:,t) = X_est{k+1}(:,t) + beta(j,t+1) * Xjt_est{j,t};
+            P_est{k+1}(:,:,t) = P_est{k+1}(:,:,t) + beta(j,t+1) * Xjt_est{j,t} * Xjt_est{j,t}';
+        end
+        P_est{k+1}(:,:,t) = P_est{k+1}(:,:,t) - X_est{k+1}(:,t) * X_est{k+1}(:,t)';
+    end
+    X_plt2 = [X_plt2 X_est{k+1}];                               % 用于绘图
+end
+
+figure;
+for t = 1:T
+    X_plt = [];
+    for k = 1:N
+    X_plt = [X_plt X_est{k}(:,t)];
+    end
+    plot(X_plt(1,:),X_plt(3,:));clear X_plt;
+    hold on;
+end
+title('JPDA跟踪结果')
+legend('1','2','3','4')
+
+
+figure;
+plot(X_plt2(1,:),X_plt2(3,:),'.');
+
+%% 误差分析
+figure;
+for t = 1:T
+    for k = 1:N
+    Err(:,k,t) = X{k}(:,t) - X_est{k}(:,t);
+    ErrRange(k,t) = sqrt(Err(1,k,t)^2 + Err(3,k,t)^2);
+    end
+    plot(ErrRange(:,t));hold on;
+end
+title('JPDA距离RMSE')
+legend('1','2','3','4')
+
+
